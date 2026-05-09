@@ -1,119 +1,124 @@
-import { useEffect, useState, useRef, useCallback } from "react";
-import type { MarketSnapshot, WeeklyRow } from "../data/types";
-import { PLATFORMS } from "../data/types";
-import {
-  getDataset,
-  aggregateByPlatform,
-  getWeeklyAverages,
-} from "../data/dataset";
+'use client'
+import { useState, useEffect, useRef } from 'react'
+import { PLATFORMS, ZONES, TIERS, ZONE_MULTIPLIERS } from '@/lib/data/types'
 
-const TICK_MS = 4000; // 4s between ticks
-
-function getCurrentSliceIndex(): number {
-  const now = new Date();
-  const hour = now.getHours();
-  const dayOfWeek = (now.getDay() + 6) % 7; // JS: 0=Sun → 0=Mon
-  return hour * 7 + dayOfWeek;
+function randomFrom<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)]
 }
 
-// Walk the dataset in order, looping — gives "live" feel
-let _cursor = 0;
-function nextBatch(size = 40): ReturnType<typeof getDataset> {
-  const ds = getDataset();
-  const batch = [];
-  for (let i = 0; i < size; i++) {
-    batch.push(ds[(_cursor + i) % ds.length]);
+function randomInt(min: number, max: number) {
+  return Math.floor(Math.random() * (max - min + 1)) + min
+}
+
+export interface SimOrder {
+  id: string
+  platform_id: string
+  platform_name: string
+  zone: string
+  riders_requested: number
+  riders_confirmed: number
+  tier: 'basic' | 'standard' | 'surge'
+  ppd: number
+  total_cost: number
+  status: 'pending' | 'active' | 'fulfilled' | 'cancelled'
+  created_at: string
+}
+
+export interface GigSlot {
+  id: string
+  platform: string
+  platformId: string
+  zone: string
+  ppd: number
+  time: string
+  ridersLeft: number
+}
+
+function generateOrder(): SimOrder {
+  const platform = randomFrom(PLATFORMS)
+  const zone = randomFrom(ZONES)
+  const riders = randomInt(1, 80)
+  const tier = riders <= 10 ? 'basic' : riders <= 50 ? 'standard' : 'surge'
+  const mult = ZONE_MULTIPLIERS[zone] ?? 1.0
+  const ppd = Math.round(TIERS[tier].basePPD * mult)
+  return {
+    id: crypto.randomUUID(),
+    platform_id: platform.id,
+    platform_name: platform.name,
+    zone,
+    riders_requested: riders,
+    riders_confirmed: randomInt(0, riders),
+    tier,
+    ppd,
+    total_cost: ppd * riders,
+    status: randomFrom(['pending', 'active', 'active', 'fulfilled']),
+    created_at: new Date().toISOString()
   }
-  _cursor = (_cursor + size) % ds.length;
-  return batch;
 }
 
-function snapshotFromBatch(
-  batch: ReturnType<typeof getDataset>
-): MarketSnapshot[] {
-  const agg = aggregateByPlatform(batch);
-  return PLATFORMS.map((p) => {
-    const found = agg.find((a) => a.platformId === p.id);
-    if (!found) {
-      return {
-        platformId: p.id,
-        demand: 0,
-        supply: 0,
-        shortage: 0,
-        ppd: 0,
-        surgeMult: 1,
-        fulfillmentRate: 1,
-        trend: "stable" as const,
-      };
-    }
-    const trend: MarketSnapshot["trend"] =
-      found.shortage > 5 ? "up" : found.fulfillmentRate > 0.9 ? "down" : "stable";
-    return { ...found, trend };
-  });
+function generateSlot(): GigSlot {
+  const platform = randomFrom(PLATFORMS)
+  const zone = randomFrom(ZONES)
+  const mult = ZONE_MULTIPLIERS[zone] ?? 1.0
+  const ppd = Math.round(platform.basePPD * mult) + randomInt(0, 5)
+  const now = new Date()
+  now.setMinutes(now.getMinutes() + randomInt(5, 90))
+  return {
+    id: crypto.randomUUID(),
+    platform: platform.name,
+    platformId: platform.id,
+    zone,
+    ppd,
+    time: now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
+    ridersLeft: randomInt(1, 20)
+  }
 }
 
 export function useSimulation() {
-  const [snapshots, setSnapshots] = useState<MarketSnapshot[]>(() =>
-    snapshotFromBatch(nextBatch())
-  );
-  const [weekly, setWeekly] = useState<WeeklyRow[]>(() => getWeeklyAverages());
-  const [lastTick, setLastTick] = useState(new Date());
-  const [tickCount, setTickCount] = useState(0);
-  const [pulseId, setPulseId] = useState<string | null>(null);
-  const prevSnapshotsRef = useRef<MarketSnapshot[]>(snapshots);
-  const running = useRef(true);
-
-  const tick = useCallback(() => {
-    const batch = nextBatch(40);
-    const next = snapshotFromBatch(batch);
-
-    // Find biggest change to pulse
-    let maxDelta = 0;
-    let pulseTarget: string | null = null;
-    for (const n of next) {
-      const prev = prevSnapshotsRef.current.find(
-        (s) => s.platformId === n.platformId
-      );
-      if (prev) {
-        const delta = Math.abs(n.ppd - prev.ppd);
-        if (delta > maxDelta) {
-          maxDelta = delta;
-          pulseTarget = n.platformId;
-        }
-      }
-    }
-
-    prevSnapshotsRef.current = next;
-    setSnapshots(next);
-    setLastTick(new Date());
-    setTickCount((c) => c + 1);
-
-    if (pulseTarget) {
-      setPulseId(pulseTarget);
-      setTimeout(() => setPulseId(null), 700);
-    }
-  }, []);
+  const [liveOrders, setLiveOrders] = useState<SimOrder[]>(() =>
+    Array.from({ length: 30 }, generateOrder)
+  )
+  const [gigSlots, setGigSlots] = useState<GigSlot[]>(() =>
+    Array.from({ length: 12 }, generateSlot)
+  )
+  const tickRef = useRef(0)
 
   useEffect(() => {
-    running.current = true;
-    const id = setInterval(() => {
-      if (running.current) tick();
-    }, TICK_MS);
-    return () => {
-      running.current = false;
-      clearInterval(id);
-    };
-  }, [tick]);
+    const interval = setInterval(() => {
+      tickRef.current++
 
-  return { snapshots, weekly, lastTick, tickCount, pulseId };
-}
+      // Every 4s: add a new order
+      setLiveOrders(prev => {
+        const updated = prev.map(o => {
+          if (o.status === 'active' && Math.random() < 0.1) {
+            return { ...o, riders_confirmed: Math.min(o.riders_confirmed + 1, o.riders_requested) }
+          }
+          if (o.status === 'pending' && Math.random() < 0.15) {
+            return { ...o, status: 'active' as const }
+          }
+          return o
+        })
+        if (tickRef.current % 3 === 0) {
+          return [generateOrder(), ...updated.slice(0, 79)]
+        }
+        return updated
+      })
 
-// Compute optimal PPD to fill a demand target
-export function computeOptimalPPD(demandTarget: number, basePPD = 29): number {
-  return Math.round(basePPD * (1 + (demandTarget / 20) * 0.4) * 10) / 10;
-}
+      // Every 10s: refresh slots
+      if (tickRef.current % 5 === 0) {
+        setGigSlots(prev => {
+          const refreshed = prev.map(s =>
+            Math.random() < 0.2
+              ? generateSlot()
+              : { ...s, ridersLeft: Math.max(0, s.ridersLeft - (Math.random() < 0.3 ? 1 : 0)) }
+          )
+          return [...refreshed.filter(s => s.ridersLeft > 0), generateSlot()].slice(0, 12)
+        })
+      }
+    }, 2000)
 
-// Project how many riders a given PPD will attract
-export function projectSupply(ppd: number, demandTarget: number): number {
-  return Math.min(demandTarget, Math.floor((ppd / 29) * 15));
+    return () => clearInterval(interval)
+  }, [])
+
+  return { liveOrders, gigSlots }
 }
