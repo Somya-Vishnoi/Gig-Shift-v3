@@ -1,432 +1,366 @@
-"use client";
-
-import { useState, useEffect, useRef } from "react";
-import { ZONES } from "@/lib/data/types";
+'use client'
+import { useState, useEffect } from 'react'
+import { GigShiftLogo } from '@/components/shared/Logo'
+import { LanguageSelector } from '@/components/shared/LanguageSelector'
 import {
-  TIERS, TIME_WINDOWS, computeQuote, generateOrderId,
-  getFulfillmentRatePerTick, timeWindowToNoticeMinutes,
-  type OrderRequest, type PriceQuote,
-} from "@/lib/simulation/orders";
-import { ChevronDown, CheckCircle, Clock, AlertTriangle } from "lucide-react";
+  getOrders, createOrder, updateOrderStatus,
+  subscribeToOrders, getRiders
+} from '@/lib/supabase/db'
+import { TIERS, ZONE_MULTIPLIERS, t, type LangCode, type Platform, type Order, type Rider, type TierKey } from '@/lib/data/types'
+import { useSimulation } from '@/lib/simulation/engine'
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 
-interface Props {
-  dark: boolean;
-  name: string;
-  email?: string;
+interface PlatformDashboardProps {
+  platform: Platform
+  onLogout: () => void
+  onLanguageChange: (lang: LangCode) => void
 }
 
-type Step = "request" | "quote" | "fulfilling";
-type HistoryTab = "active" | "history";
+export function PlatformDashboard({ platform, onLogout, onLanguageChange }: PlatformDashboardProps) {
+  const lang = platform.language as LangCode
+  const [orders, setOrders] = useState<Order[]>([])
+  const [availableRiders, setAvailableRiders] = useState<Rider[]>([])
+  const [tab, setTab] = useState<'dashboard' | 'new_order' | 'orders' | 'riders' | 'sla'>('dashboard')
 
-export default function PlatformDashboard({ dark, name, email: _email }: Props) {
-  const [step, setStep] = useState<Step>("request");
-  const [historyTab, setHistoryTab] = useState<HistoryTab>("active");
-  const [zone, setZone] = useState(ZONES[0]);
-  const [riderCount, setRiderCount] = useState(20);
-  const [timeWindow, setTimeWindow] = useState(TIME_WINDOWS[2]);
-  const [quote, setQuote] = useState<PriceQuote | null>(null);
-  const [activeOrder, setActiveOrder] = useState<OrderRequest | null>(null);
-  const [orders, setOrders] = useState<OrderRequest[]>([]);
-  const fulfillInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  // New order form
+  const [selectedZone, setSelectedZone] = useState(platform.zones?.[0] ?? '')
+  const [ridersNeeded, setRidersNeeded] = useState(5)
+  const [placing, setPlacing] = useState(false)
+  const [placed, setPlaced] = useState(false)
 
-  const noticeMinutes = timeWindowToNoticeMinutes(timeWindow);
+  const { liveOrders } = useSimulation()
 
   useEffect(() => {
-    if (step === "quote") setQuote(computeQuote(riderCount, zone, noticeMinutes));
-  }, [riderCount, zone, timeWindow, step, noticeMinutes]);
+    getOrders(platform.id).then(setOrders)
+    getRiders().then(r => setAvailableRiders(r.filter(rider => rider.status === 'active')))
 
-  function handleGetQuote() {
-    setQuote(computeQuote(riderCount, zone, noticeMinutes));
-    setStep("quote");
+    const sub = subscribeToOrders(order => {
+      if (order.platform_id !== platform.id) return
+      setOrders(prev => {
+        const idx = prev.findIndex(o => o.id === order.id)
+        if (idx >= 0) { const u = [...prev]; u[idx] = order; return u }
+        return [order, ...prev]
+      })
+    })
+    return () => { sub.unsubscribe() }
+  }, [platform.id])
+
+  // Calculate tier
+  const tier: TierKey = ridersNeeded <= 10 ? 'basic' : ridersNeeded <= 50 ? 'standard' : 'surge'
+  const tierConfig = TIERS[tier]
+  const zoneMultiplier = ZONE_MULTIPLIERS[selectedZone] ?? 1.0
+  const ppd = Math.round(tierConfig.basePPD * zoneMultiplier)
+  const totalCost = ppd * ridersNeeded
+
+  // SLA data
+  const slaData = orders.slice(0, 7).map((o, i) => ({
+    order: `#${i + 1}`,
+    target: platform.sla_target_minutes,
+    actual: platform.sla_target_minutes - 5 + Math.floor(Math.random() * 15)
+  }))
+
+  // Stats
+  const activeOrders = orders.filter(o => o.status === 'active').length
+  const fulfilledOrders = orders.filter(o => o.status === 'fulfilled').length
+  const totalSpend = orders.reduce((s, o) => s + (o.total_cost ?? 0), 0)
+
+  const handlePlaceOrder = async () => {
+    setPlacing(true)
+    try {
+      const order = await createOrder({
+        platform_id: platform.id,
+        platform_name: platform.company_name,
+        zone: selectedZone,
+        riders_requested: ridersNeeded,
+        riders_confirmed: 0,
+        tier,
+        ppd,
+        total_cost: totalCost,
+        status: 'pending'
+      })
+      setOrders(prev => [order, ...prev])
+      setPlaced(true)
+      setTimeout(() => { setPlaced(false); setTab('orders') }, 2000)
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setPlacing(false)
+    }
   }
 
-  function handleConfirm() {
-    if (!quote) return;
-    const order: OrderRequest = {
-      id: generateOrderId(), zone, ridersRequested: riderCount,
-      timeWindow, noticeMinutes, placedAt: new Date(),
-      tier: quote.tier.name, quotedPPD: quote.finalPPD,
-      totalQuote: quote.totalCost, status: "fulfilling", ridersConfirmed: 0,
-    };
-    setActiveOrder(order);
-    setStep("fulfilling");
-    let confirmed = 0;
-    fulfillInterval.current = setInterval(() => {
-      const rate = getFulfillmentRatePerTick(quote.tier.name, riderCount);
-      confirmed = Math.min(riderCount, confirmed + rate);
-      setActiveOrder(prev => prev ? { ...prev, ridersConfirmed: confirmed, status: confirmed >= riderCount ? "fulfilled" : "fulfilling" } : prev);
-      if (confirmed >= riderCount) {
-        clearInterval(fulfillInterval.current!);
-        const done: OrderRequest = { ...order, ridersConfirmed: riderCount, status: "fulfilled" };
-        setOrders(prev => [done, ...prev]);
-      }
-    }, 1800);
-  }
-
-  function handleReset() {
-    fulfillInterval.current && clearInterval(fulfillInterval.current);
-    setActiveOrder(null);
-    setQuote(null);
-    setStep("request");
-  }
-
-  const surface = dark ? "bg-[#111827] border-gray-800" : "bg-white border-gray-200";
-  const muted = dark ? "text-gray-400" : "text-gray-500";
-  const heading = dark ? "text-gray-100" : "text-gray-900";
-  const sub = dark ? "text-gray-500" : "text-gray-400";
-  const divider = dark ? "border-gray-800" : "border-gray-100";
-  const inputClass = `w-full px-3.5 py-2.5 rounded-lg border text-[14px] outline-none transition-colors ${
-    dark
-      ? "bg-[#0C0C0C] border-gray-800 text-gray-100 focus:border-[#059669]"
-      : "bg-white border-gray-200 text-gray-900 focus:border-[#059669]"
-  }`;
-
-  const fulfillPct = activeOrder
-    ? Math.round((activeOrder.ridersConfirmed / activeOrder.ridersRequested) * 100)
-    : 0;
-
-  const tier = TIERS.find(t => t.name === (noticeMinutes < 30 || riderCount > 50 ? "surge" : riderCount > 10 ? "standard" : "basic"))!;
+  const TABS = [
+    { key: 'dashboard', label: 'Dashboard' },
+    { key: 'new_order', label: 'New Order' },
+    { key: 'orders', label: 'My Orders' },
+    { key: 'riders', label: 'Riders' },
+    { key: 'sla', label: 'SLA' },
+  ] as const
 
   return (
-    <div className={`min-h-screen ${dark ? "bg-[#0C0C0C]" : "bg-gray-50"}`}>
-      <div className="max-w-3xl mx-auto px-6 py-8">
-
-        {/* Page header */}
-        <div className="flex items-start justify-between mb-8">
-          <div>
-            <h1 className={`text-[24px] font-semibold tracking-tight mb-1 ${heading}`}>
-              Platform Operations
-            </h1>
-            <p className={`text-[14px] ${muted}`}>{name} · Request and manage rider dispatch</p>
-          </div>
-          {orders.length > 0 && (
-            <div className="flex gap-1">
-              {(["active", "history"] as const).map(t => (
-                <button key={t} onClick={() => setHistoryTab(t)}
-                  className={`px-3 py-1.5 text-[12px] font-medium rounded-lg cursor-pointer transition-colors ${
-                    historyTab === t
-                      ? "bg-gray-900 text-white dark:bg-white dark:text-gray-900"
-                      : `${muted} hover:bg-gray-100 dark:hover:bg-gray-800`
-                  }`}>
-                  {t === "active" ? "New order" : `History (${orders.length})`}
-                </button>
-              ))}
+    <div className="min-h-screen bg-[#F9FAFB] dark:bg-[#0C0C0C]">
+      <header className="sticky top-0 z-30 bg-white dark:bg-[#111827] border-b border-[#E5E7EB] dark:border-[#1F2937] px-4 py-3">
+        <div className="max-w-5xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <GigShiftLogo size={28} theme={platform.dark_mode ? 'dark' : 'light'} />
+            <div>
+              <div className="text-sm font-semibold text-[#111827] dark:text-[#F9FAFB]">{platform.company_name}</div>
+              <div className="text-xs text-[#6B7280]">{platform.city} · ID: {platform.employee_id}</div>
             </div>
-          )}
+          </div>
+          <div className="flex items-center gap-2">
+            <LanguageSelector size="sm" value={lang} onChange={onLanguageChange} />
+            <button onClick={onLogout} className="text-xs text-[#6B7280] hover:text-[#111827] transition-colors">
+              {t('logout', lang)}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="max-w-5xl mx-auto px-4 py-5">
+        {/* Tabs */}
+        <div className="flex gap-1 mb-6 overflow-x-auto pb-1">
+          {TABS.map(tb => (
+            <button
+              key={tb.key}
+              onClick={() => setTab(tb.key)}
+              className={`shrink-0 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                tab === tb.key
+                  ? 'bg-[#111827] dark:bg-[#F9FAFB] text-white dark:text-[#111827]'
+                  : 'text-[#6B7280] hover:text-[#111827] dark:hover:text-[#F9FAFB] bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937]'
+              }`}
+            >
+              {tb.label}
+            </button>
+          ))}
         </div>
 
-        {/* History view */}
-        {historyTab === "history" && orders.length > 0 && (
-          <div className="gs-fade-in">
-            <div className={`rounded-xl border ${surface} overflow-hidden`}>
-              <div className={`px-4 py-3 border-b ${divider}`}>
-                <span className={`text-[11px] font-medium tracking-widest uppercase ${sub}`}>Order history</span>
+        {/* Dashboard */}
+        {tab === 'dashboard' && (
+          <div className="space-y-5">
+            <div className="grid grid-cols-3 gap-3">
+              {[
+                { label: 'Active Orders', value: activeOrders + liveOrders.filter((o: any) => o.platform_name === platform.company_name).length },
+                { label: 'Fulfilled', value: fulfilledOrders },
+                { label: 'Total Spend', value: `₹${totalSpend.toLocaleString('en-IN')}` },
+              ].map(s => (
+                <div key={s.label} className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] px-4 py-4">
+                  <div className="text-2xl font-bold text-[#111827] dark:text-[#F9FAFB]">{s.value}</div>
+                  <div className="text-xs text-[#6B7280] mt-1">{s.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Zone availability */}
+            <div className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] p-4">
+              <h3 className="text-sm font-semibold text-[#111827] dark:text-[#F9FAFB] mb-3">Rider Availability by Zone</h3>
+              <div className="space-y-2">
+                {(platform.zones ?? []).map(zone => {
+                  const count = availableRiders.filter(r => r.zone === zone).length
+                  const pct = Math.min(100, (count / 20) * 100)
+                  return (
+                    <div key={zone} className="flex items-center gap-3">
+                      <span className="text-xs text-[#6B7280] w-28 shrink-0">{zone}</span>
+                      <div className="flex-1 h-2 rounded-full bg-[#F3F4F6] dark:bg-[#1F2937] overflow-hidden">
+                        <div className="h-full rounded-full bg-[#059669] transition-all" style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className="text-xs font-medium text-[#111827] dark:text-[#F9FAFB] w-8 text-right">{count}</span>
+                    </div>
+                  )
+                })}
               </div>
-              {orders.map((o, i) => {
-                const t = TIERS.find(t => t.name === o.tier)!;
-                return (
-                  <div key={o.id} className={`px-4 py-4 flex items-center justify-between ${i < orders.length - 1 ? `border-b ${divider}` : ""}`}>
-                    <div className="flex items-center gap-3">
-                      <CheckCircle size={16} className="text-[#059669] shrink-0" />
-                      <div>
-                        <div className={`text-[13px] font-semibold ${heading}`}>{o.id}</div>
-                        <div className={`text-[12px] ${muted}`}>{o.zone} · {o.timeWindow}</div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-6">
-                      <div className="text-right">
-                        <div className={`text-[12px] font-mono ${heading}`}>{o.ridersConfirmed}/{o.ridersRequested} riders</div>
-                        <div className={`text-[11px] ${muted}`}>{t.label} tier</div>
-                      </div>
-                      <div className={`text-[15px] font-semibold text-[#059669]`}>₹{o.totalQuote}</div>
-                    </div>
+            </div>
+
+            {/* Quick order button */}
+            <button
+              onClick={() => setTab('new_order')}
+              className="w-full py-4 rounded-xl bg-[#059669] text-white text-sm font-semibold hover:bg-[#047857] transition-colors"
+            >
+              + Place New Rider Order
+            </button>
+          </div>
+        )}
+
+        {/* New Order */}
+        {tab === 'new_order' && (
+          <div className="max-w-lg mx-auto">
+            <div className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] p-5">
+              <h2 className="text-base font-bold text-[#111827] dark:text-[#F9FAFB] mb-5">Place Rider Order</h2>
+
+              <div className="space-y-4">
+                {/* Zone select */}
+                <div>
+                  <label className="text-xs font-medium text-[#6B7280] block mb-1.5">{t('zone', lang)}</label>
+                  <div className="flex flex-wrap gap-2">
+                    {(platform.zones ?? []).map(zone => (
+                      <button
+                        key={zone}
+                        onClick={() => setSelectedZone(zone)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                          selectedZone === zone
+                            ? 'bg-[#059669] text-white border-[#059669]'
+                            : 'border-[#E5E7EB] dark:border-[#1F2937] text-[#6B7280] hover:border-[#059669]'
+                        }`}
+                      >
+                        {zone}
+                      </button>
+                    ))}
                   </div>
-                );
-              })}
+                </div>
+
+                {/* Riders needed */}
+                <div>
+                  <label className="text-xs font-medium text-[#6B7280] block mb-1.5">
+                    Riders Needed: <span className="text-[#111827] dark:text-[#F9FAFB] font-bold">{ridersNeeded}</span>
+                  </label>
+                  <input
+                    type="range"
+                    min={1}
+                    max={200}
+                    value={ridersNeeded}
+                    onChange={e => setRidersNeeded(Number(e.target.value))}
+                    className="w-full accent-[#059669]"
+                  />
+                  <div className="flex justify-between text-[10px] text-[#9CA3AF] mt-1">
+                    <span>1</span><span>50</span><span>100</span><span>200</span>
+                  </div>
+                </div>
+
+                {/* Tier indicator */}
+                <div className="grid grid-cols-3 gap-2">
+                  {(Object.entries(TIERS) as [TierKey, typeof TIERS[TierKey]][]).map(([key, t]) => (
+                    <div key={key} className={`rounded-lg border p-3 transition-colors ${tier === key ? 'border-[#059669] bg-[#F0FDF4] dark:bg-[#052e16]' : 'border-[#E5E7EB] dark:border-[#1F2937]'}`}>
+                      <div className="text-xs font-semibold text-[#111827] dark:text-[#F9FAFB] capitalize">{key}</div>
+                      <div className="text-[10px] text-[#6B7280] mt-0.5">{t.minRiders}–{t.maxRiders} riders</div>
+                      <div className="text-xs font-bold text-[#059669] mt-1">₹{t.basePPD} base</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Cost breakdown */}
+                <div className="rounded-lg bg-[#F9FAFB] dark:bg-[#0C0C0C] border border-[#E5E7EB] dark:border-[#1F2937] p-3 space-y-1.5">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-[#6B7280]">Base PPD</span>
+                    <span className="text-[#111827] dark:text-[#F9FAFB]">₹{tierConfig.basePPD}</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-[#6B7280]">Zone multiplier ({selectedZone})</span>
+                    <span className="text-[#111827] dark:text-[#F9FAFB]">{zoneMultiplier}x</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-[#6B7280]">Final PPD</span>
+                    <span className="font-bold text-[#059669]">₹{ppd}</span>
+                  </div>
+                  <div className="border-t border-[#E5E7EB] dark:border-[#1F2937] pt-1.5 flex justify-between text-sm">
+                    <span className="font-semibold text-[#111827] dark:text-[#F9FAFB]">Total ({ridersNeeded} riders)</span>
+                    <span className="font-bold text-[#111827] dark:text-[#F9FAFB]">₹{totalCost.toLocaleString('en-IN')}</span>
+                  </div>
+                  <div className="text-[10px] text-[#6B7280]">Notice period: {tierConfig.notice}</div>
+                </div>
+
+                <button
+                  onClick={handlePlaceOrder}
+                  disabled={placing || placed || !selectedZone}
+                  className={`w-full py-3.5 rounded-xl text-sm font-semibold transition-colors ${
+                    placed
+                      ? 'bg-[#D1FAE5] text-[#059669] cursor-default'
+                      : 'bg-[#059669] text-white hover:bg-[#047857] disabled:opacity-40 disabled:cursor-not-allowed'
+                  }`}
+                >
+                  {placed ? '✓ Order Placed!' : placing ? 'Placing...' : `Place Order — ₹${totalCost.toLocaleString('en-IN')}`}
+                </button>
+              </div>
             </div>
           </div>
         )}
 
-        {/* Active: Request / Quote / Fulfilling */}
-        {historyTab === "active" && (
-          <div className="space-y-4 gs-fade-in">
-
-            {/* Tier info bar */}
-            <div className={`rounded-xl border ${surface} overflow-hidden`}>
-              <div className={`px-4 py-3 border-b ${divider}`}>
-                <span className={`text-[11px] font-medium tracking-widest uppercase ${sub}`}>Service tiers</span>
-              </div>
-              <div className="grid grid-cols-3 divide-x divide-gray-100 dark:divide-gray-800">
-                {TIERS.map(t => (
-                  <div key={t.name} className={`px-4 py-3 ${tier.name === t.name ? (dark ? "bg-[#059669]/5" : "bg-[#F0FDF4]") : ""}`}>
-                    <div className={`text-[11px] font-semibold mb-0.5`} style={{ color: tier.name === t.name ? "#059669" : undefined }}>
-                      <span className={tier.name === t.name ? "text-[#059669]" : muted}>{t.label}</span>
+        {/* Orders */}
+        {tab === 'orders' && (
+          <div className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] overflow-hidden">
+            <div className="px-4 py-3 border-b border-[#E5E7EB] dark:border-[#1F2937]">
+              <h3 className="text-sm font-semibold text-[#111827] dark:text-[#F9FAFB]">My Orders</h3>
+            </div>
+            {orders.length === 0 ? (
+              <div className="text-center py-12 text-sm text-[#6B7280]">No orders yet.</div>
+            ) : (
+              <div className="divide-y divide-[#E5E7EB] dark:divide-[#1F2937]">
+                {orders.map(o => (
+                  <div key={o.id} className="flex items-center justify-between px-4 py-3">
+                    <div>
+                      <div className="text-sm font-medium text-[#111827] dark:text-[#F9FAFB]">{o.zone}</div>
+                      <div className="text-xs text-[#6B7280]">{o.riders_confirmed}/{o.riders_requested} riders · ₹{o.ppd}/delivery · {o.tier}</div>
                     </div>
-                    <div className={`text-[12px] ${muted}`}>{t.description}</div>
-                    <div className={`text-[15px] font-semibold mt-1 ${tier.name === t.name ? "text-[#059669]" : heading}`}>
-                      ₹{t.basePPD}<span className={`text-[11px] font-normal ${muted}`}>/rider</span>
+                    <div className="text-right">
+                      <div className="text-sm font-bold text-[#111827] dark:text-[#F9FAFB]">₹{o.total_cost?.toLocaleString('en-IN')}</div>
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${
+                        o.status === 'active' ? 'bg-[#D1FAE5] text-[#059669]' :
+                        o.status === 'fulfilled' ? 'bg-[#F3F4F6] text-[#6B7280]' : 'bg-[#FEF3C7] text-[#D97706]'
+                      }`}>{o.status}</span>
                     </div>
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+        )}
+
+        {/* Riders */}
+        {tab === 'riders' && (
+          <div className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] overflow-hidden">
+            <div className="px-4 py-3 border-b border-[#E5E7EB] dark:border-[#1F2937]">
+              <h3 className="text-sm font-semibold text-[#111827] dark:text-[#F9FAFB]">Riders in Your Zones</h3>
             </div>
-
-            {/* Step: Request form */}
-            {step === "request" && (
-              <div className={`rounded-xl border ${surface}`}>
-                <div className={`px-5 py-4 border-b ${divider}`}>
-                  <span className={`text-[13px] font-semibold ${heading}`}>New rider request</span>
-                </div>
-                <div className="p-5 space-y-4">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className={`block text-[12px] font-medium mb-1.5 ${muted}`}>Zone</label>
-                      <div className="relative">
-                        <select value={zone} onChange={e => setZone(e.target.value)} className={`${inputClass} appearance-none pr-8 cursor-pointer`}>
-                          {ZONES.map(z => <option key={z} value={z}>{z}</option>)}
-                        </select>
-                        <ChevronDown size={14} className={`absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none ${muted}`} />
-                      </div>
+            <div className="divide-y divide-[#E5E7EB] dark:divide-[#1F2937]">
+              {availableRiders.filter(r => (platform.zones ?? []).includes(r.zone)).slice(0, 50).map(r => (
+                <div key={r.id} className="flex items-center justify-between px-4 py-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-full bg-[#F0FDF4] flex items-center justify-center text-sm font-bold text-[#059669]">
+                      {r.name[0]}
                     </div>
                     <div>
-                      <label className={`block text-[12px] font-medium mb-1.5 ${muted}`}>Dispatch time</label>
-                      <div className="relative">
-                        <select value={timeWindow} onChange={e => setTimeWindow(e.target.value)} className={`${inputClass} appearance-none pr-8 cursor-pointer`}>
-                          {TIME_WINDOWS.map(t => <option key={t} value={t}>{t}</option>)}
-                        </select>
-                        <ChevronDown size={14} className={`absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none ${muted}`} />
-                      </div>
+                      <div className="text-sm font-medium text-[#111827] dark:text-[#F9FAFB]">{r.name}</div>
+                      <div className="text-xs text-[#6B7280]">{r.zone} · {r.vehicle_type}</div>
                     </div>
                   </div>
-
-                  {/* Rider count — stepper, not slider */}
-                  <div>
-                    <label className={`block text-[12px] font-medium mb-1.5 ${muted}`}>Riders required</label>
-                    <div className="flex items-center gap-3">
-                      <button onClick={() => setRiderCount(c => Math.max(1, c - 5))}
-                        className={`w-9 h-9 rounded-lg border flex items-center justify-center text-lg font-light cursor-pointer transition-colors ${
-                          dark ? "border-gray-700 text-gray-300 hover:bg-gray-800" : "border-gray-200 text-gray-600 hover:bg-gray-50"
-                        }`}>−</button>
-                      <div className="flex-1 relative">
-                        <input
-                          type="number" value={riderCount}
-                          onChange={e => setRiderCount(Math.max(1, Math.min(200, Number(e.target.value))))}
-                          className={`${inputClass} text-center text-[18px] font-semibold`}
-                        />
-                      </div>
-                      <button onClick={() => setRiderCount(c => Math.min(200, c + 5))}
-                        className={`w-9 h-9 rounded-lg border flex items-center justify-center text-lg font-light cursor-pointer transition-colors ${
-                          dark ? "border-gray-700 text-gray-300 hover:bg-gray-800" : "border-gray-200 text-gray-600 hover:bg-gray-50"
-                        }`}>+</button>
-                      <div className="flex gap-1">
-                        {[10, 25, 50, 100].map(n => (
-                          <button key={n} onClick={() => setRiderCount(n)}
-                            className={`px-2.5 py-1.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
-                              riderCount === n
-                                ? "bg-[#059669] text-white"
-                                : dark ? "bg-gray-800 text-gray-400 hover:bg-gray-700" : "bg-gray-100 text-gray-500 hover:bg-gray-200"
-                            }`}>{n}</button>
-                        ))}
-                      </div>
-                    </div>
-                    <div className={`mt-1.5 text-[11px] ${sub}`}>
-                      Current tier: <span className="font-semibold text-[#059669]">{tier.label}</span> · {tier.description}
-                    </div>
-                  </div>
-
-                  <button onClick={handleGetQuote}
-                    className="w-full py-2.5 rounded-lg bg-[#059669] text-white text-[14px] font-semibold cursor-pointer hover:bg-[#047857] transition-colors">
-                    Get quote
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Step: Quote */}
-            {step === "quote" && quote && (
-              <div className={`rounded-xl border ${surface} gs-fade-in`}>
-                <div className={`px-5 py-4 border-b ${divider} flex items-center justify-between`}>
-                  <span className={`text-[13px] font-semibold ${heading}`}>Price quote</span>
-                  <button onClick={() => setStep("request")} className={`text-[12px] cursor-pointer ${muted} hover:text-gray-700`}>Edit request</button>
-                </div>
-                <div className="p-5">
-                  <div className={`rounded-lg p-4 mb-4 ${dark ? "bg-[#0C0C0C]" : "bg-gray-50"} border ${divider}`}>
-                    <div className="grid grid-cols-3 gap-4 mb-4">
-                      <div>
-                        <div className={`text-[11px] ${sub} mb-1`}>Riders</div>
-                        <div className={`text-[22px] font-bold ${heading}`}>{riderCount}</div>
-                      </div>
-                      <div>
-                        <div className={`text-[11px] ${sub} mb-1`}>Rate per rider</div>
-                        <div className="text-[22px] font-bold text-[#059669]">₹{quote.finalPPD}</div>
-                      </div>
-                      <div>
-                        <div className={`text-[11px] ${sub} mb-1`}>Total</div>
-                        <div className={`text-[22px] font-bold ${heading}`}>₹{quote.totalCost}</div>
-                      </div>
-                    </div>
-
-                    <div className={`border-t pt-3 ${divider}`}>
-                      <div className={`text-[11px] font-medium mb-2 ${sub}`}>Pricing breakdown</div>
-                      <div className="grid grid-cols-4 gap-2 text-[12px]">
-                        <div>
-                          <div className={sub}>Base</div>
-                          <div className={`font-mono font-medium ${heading}`}>₹{quote.basePPD}</div>
-                        </div>
-                        <div>
-                          <div className={sub}>Time</div>
-                          <div className={`font-mono font-medium ${quote.multipliers.hour > 1.2 ? "text-amber-500" : "text-[#059669]"}`}>
-                            ×{quote.multipliers.hour.toFixed(2)}
-                          </div>
-                        </div>
-                        <div>
-                          <div className={sub}>Zone</div>
-                          <div className={`font-mono font-medium ${quote.multipliers.zone > 1.1 ? "text-amber-500" : "text-[#059669]"}`}>
-                            ×{quote.multipliers.zone.toFixed(2)}
-                          </div>
-                        </div>
-                        <div>
-                          <div className={sub}>Notice</div>
-                          <div className={`font-mono font-medium ${quote.multipliers.notice > 1.2 ? "text-red-500" : "text-[#059669]"}`}>
-                            ×{quote.multipliers.notice.toFixed(2)}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <button onClick={() => setStep("request")}
-                      className={`py-2.5 rounded-lg border text-[13px] font-medium cursor-pointer transition-colors ${
-                        dark ? "border-gray-700 text-gray-300 hover:bg-gray-800" : "border-gray-200 text-gray-700 hover:bg-gray-50"
-                      }`}>
-                      Back
-                    </button>
-                    <button onClick={handleConfirm}
-                      className="py-2.5 rounded-lg bg-[#059669] text-white text-[13px] font-semibold cursor-pointer hover:bg-[#047857] transition-colors">
-                      Confirm order
-                    </button>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-[#F59E0B]">★ {r.rating}</span>
+                    <span className={`w-2 h-2 rounded-full ${r.is_online ? 'bg-[#10B981]' : 'bg-[#D1D5DB]'}`} />
                   </div>
                 </div>
-              </div>
-            )}
+              ))}
+            </div>
+          </div>
+        )}
 
-            {/* Step: Fulfilling */}
-            {step === "fulfilling" && activeOrder && (
-              <div className={`rounded-xl border ${surface} gs-fade-in`}>
-                <div className={`px-5 py-4 border-b ${divider} flex items-center justify-between`}>
-                  <div>
-                    <span className={`text-[13px] font-semibold ${heading}`}>{activeOrder.id}</span>
-                    <span className={`text-[12px] ml-3 ${muted}`}>{activeOrder.zone} · {activeOrder.timeWindow}</span>
-                  </div>
-                  <div className={`flex items-center gap-1.5 text-[12px] font-medium ${
-                    activeOrder.status === "fulfilled" ? "text-[#059669]" : "text-amber-500"
-                  }`}>
-                    {activeOrder.status === "fulfilled"
-                      ? <><CheckCircle size={13} /> Fulfilled</>
-                      : <><Clock size={13} /> Dispatching</>
-                    }
-                  </div>
+        {/* SLA */}
+        {tab === 'sla' && (
+          <div className="space-y-5">
+            <div className="grid grid-cols-3 gap-3">
+              {[
+                { label: 'SLA Target', value: `${platform.sla_target_minutes} min` },
+                { label: 'Avg Delivery', value: `${Math.round(platform.sla_target_minutes * 0.9)} min` },
+                { label: 'Breach Rate', value: '8%' },
+              ].map(s => (
+                <div key={s.label} className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] px-4 py-4">
+                  <div className="text-xl font-bold text-[#111827] dark:text-[#F9FAFB]">{s.value}</div>
+                  <div className="text-xs text-[#6B7280] mt-1">{s.label}</div>
                 </div>
-                <div className="p-5">
-                  {/* Progress */}
-                  <div className="flex items-end justify-between mb-3">
-                    <div>
-                      <span className={`text-[42px] font-bold tracking-tight leading-none ${heading}`}>
-                        {activeOrder.ridersConfirmed}
-                      </span>
-                      <span className={`text-[16px] ${muted} ml-1`}>/ {activeOrder.ridersRequested} riders</span>
-                    </div>
-                    <span className={`text-[14px] font-mono font-medium ${muted}`}>{fulfillPct}%</span>
-                  </div>
-
-                  <div className={`h-1.5 rounded-full mb-4 ${dark ? "bg-gray-800" : "bg-gray-100"}`}>
-                    <div
-                      className="h-full rounded-full transition-all duration-700"
-                      style={{
-                        width: `${fulfillPct}%`,
-                        background: activeOrder.status === "fulfilled" ? "#059669" : "#F59E0B"
-                      }}
-                    />
-                  </div>
-
-                  <div className={`grid grid-cols-3 gap-3 pt-3 border-t ${divider} text-center`}>
-                    <div>
-                      <div className={`text-[11px] ${sub} mb-0.5`}>Rate/rider</div>
-                      <div className={`text-[14px] font-semibold ${heading}`}>₹{activeOrder.quotedPPD}</div>
-                    </div>
-                    <div>
-                      <div className={`text-[11px] ${sub} mb-0.5`}>Total cost</div>
-                      <div className={`text-[14px] font-semibold ${heading}`}>₹{activeOrder.totalQuote}</div>
-                    </div>
-                    <div>
-                      <div className={`text-[11px] ${sub} mb-0.5`}>Tier</div>
-                      <div className={`text-[14px] font-semibold text-[#059669]`}>
-                        {TIERS.find(t => t.name === activeOrder.tier)?.label}
-                      </div>
-                    </div>
-                  </div>
-
-                  {activeOrder.status === "fulfilled" && (
-                    <button onClick={handleReset}
-                      className="w-full mt-4 py-2.5 rounded-lg bg-[#059669] text-white text-[13px] font-semibold cursor-pointer hover:bg-[#047857] transition-colors">
-                      Place another order
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Zone demand table */}
-            <ZoneDemandTable dark={dark} surface={surface} muted={muted} heading={heading} sub={sub} divider={divider} />
+              ))}
+            </div>
+            <div className="rounded-xl bg-white dark:bg-[#111827] border border-[#E5E7EB] dark:border-[#1F2937] p-4">
+              <h3 className="text-sm font-semibold text-[#111827] dark:text-[#F9FAFB] mb-3">Delivery Time vs SLA</h3>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={slaData} barSize={20}>
+                  <XAxis dataKey="order" tick={{ fontSize: 10, fill: '#6B7280' }} axisLine={false} tickLine={false} />
+                  <YAxis hide />
+                  <Tooltip contentStyle={{ border: '1px solid #E5E7EB', borderRadius: 8, fontSize: 11 }} />
+                  <Bar dataKey="target" fill="#E5E7EB" radius={[3, 3, 0, 0]} name="Target" />
+                  <Bar dataKey="actual" fill="#059669" radius={[3, 3, 0, 0]} name="Actual" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
           </div>
         )}
       </div>
     </div>
-  );
-}
-
-function ZoneDemandTable({ dark, surface, muted, heading, sub, divider }: {
-  dark: boolean; surface: string; muted: string; heading: string; sub: string; divider: string;
-}) {
-  const hour = new Date().getHours();
-  const isPeak = (hour >= 12 && hour <= 14) || (hour >= 19 && hour <= 22);
-
-  const data = ZONES.map((z, i) => {
-    const base = 35 + ((i * 17 + hour * 3) % 35);
-    const demand = isPeak ? Math.round(base * 1.4) : base;
-    const supply = Math.round(demand * (0.5 + ((i * 7 + hour) % 50) / 100));
-    const gap = Math.max(0, demand - supply);
-    return { zone: z, demand, supply, gap, pct: Math.round(Math.min(100, (supply / demand) * 100)) };
-  }).sort((a, b) => b.gap - a.gap);
-
-  return (
-    <div className={`rounded-xl border ${surface} overflow-hidden`}>
-      <div className={`px-4 py-3 border-b ${divider} flex items-center justify-between`}>
-        <span className={`text-[11px] font-medium tracking-widest uppercase ${sub}`}>Zone demand</span>
-        {isPeak && (
-          <span className="text-[11px] font-medium text-amber-500 flex items-center gap-1">
-            <AlertTriangle size={11} /> Peak hours active
-          </span>
-        )}
-      </div>
-      <div>
-        {data.map((z, i) => (
-          <div key={z.zone} className={`px-4 py-3 flex items-center gap-4 ${i < data.length - 1 ? `border-b ${divider}` : ""}`}>
-            <div className={`w-32 text-[13px] font-medium shrink-0 ${heading}`}>{z.zone}</div>
-            <div className="flex-1">
-              <div className={`h-1 rounded-full ${dark ? "bg-gray-800" : "bg-gray-100"}`}>
-                <div className="h-full rounded-full transition-all duration-500"
-                  style={{ width: `${z.pct}%`, background: z.pct >= 90 ? "#059669" : z.pct >= 60 ? "#F59E0B" : "#EF4444" }} />
-              </div>
-            </div>
-            <div className={`text-[12px] font-mono w-16 text-right ${muted}`}>{z.supply}/{z.demand}</div>
-            {z.gap > 0 && (
-              <div className="text-[11px] text-red-500 w-14 text-right font-medium">−{z.gap}</div>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+  )
 }
